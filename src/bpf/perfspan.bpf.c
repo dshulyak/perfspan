@@ -1,14 +1,16 @@
 #include "vmlinux.h"
+
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/usdt.bpf.h>
 
-struct {
+struct
+{
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
-    __uint(max_entries, 128);
+    __uint(max_entries, 128); // max number of events that can be enabled
 } perf_events SEC(".maps");
 
 struct
@@ -19,13 +21,14 @@ struct
 
 const volatile struct
 {
-    u32 enabled_events; 
+    u32 enabled_events;
 } cfg = {
     .enabled_events = 0,
 };
 
 SEC("perf_event")
-int on_perf_event(struct bpf_perf_event_data *ctx) {
+int on_perf_event(struct bpf_perf_event_data *ctx)
+{
     u32 event_id = bpf_get_attach_cookie(ctx);
     u64 sample_period = ctx->sample_period;
     u64 *val = bpf_map_lookup_elem(&perf_events, &event_id);
@@ -40,10 +43,14 @@ int on_perf_event(struct bpf_perf_event_data *ctx) {
     return 0;
 }
 
-#DEFINE ENTER = 0;
-#DEFINE EXIT = 1;
+enum
+{
+    ENTER = 0,
+    EXIT = 1
+};
 
-__always_inline stream_header(u8 *cursor, u8 event_type, u64 thread_id, u64 span_id, u64 timestamp) {
+__always_inline void stream_header(u8 *cursor, u8 event_type, u64 thread_id, u64 span_id, u64 timestamp)
+{
     *cursor = event_type;
     cursor += 1;
     *(u64 *)cursor = thread_id;
@@ -54,14 +61,16 @@ __always_inline stream_header(u8 *cursor, u8 event_type, u64 thread_id, u64 span
     cursor += 8;
 }
 
-__always_inline stream_name(u8 *cursor, u16 name_size, void *name) {
+__always_inline void stream_name(u8 *cursor, u16 name_size, void *name)
+{
     *(u16 *)cursor = name_size;
     cursor += 2;
     bpf_probe_read_user(cursor, name_size, name);
     cursor += name_size;
 }
 
-__always_inline stream_perf_events(u8 *cursor) {
+__always_inline void stream_perf_events(u8 *cursor)
+{
     // if this won't be allowed define constant for max number of events
     // and terminate early if i >= cfg.enabled_events
     for (int i = 0; i < cfg.enabled_events; i++)
@@ -80,7 +89,8 @@ __always_inline stream_perf_events(u8 *cursor) {
 }
 
 SEC("usdt")
-int BPF_USDT(perfspan_enter, u64 span_id, u16 name_size, void *name) {
+int BPF_USDT(perfspan_enter, u64 span_id, u16 name_size, void *name)
+{
     // stream the following data using ring buffer
     // ENTER || thread_id || span_id || timestamp || name_size || name || cfg.enable_events...
     // 1     || 8         || 8       || 8         || 2         || name || 8 * cfg.enable_events
@@ -88,7 +98,7 @@ int BPF_USDT(perfspan_enter, u64 span_id, u16 name_size, void *name) {
     u64 timestamp = bpf_ktime_get_ns();
     u64 to_reserve = 1 + 8 + 8 + 2 + name_size + 8 + 8 * cfg.enabled_events;
     u8 *cursor = bpf_ringbuf_reserve(&events, to_reserve, 0);
-    if !cursor
+    if (!cursor)
     {
         bpf_printk("ringbuf_reserve %d failed\n", to_reserve);
         return 1;
@@ -100,7 +110,8 @@ int BPF_USDT(perfspan_enter, u64 span_id, u16 name_size, void *name) {
 }
 
 SEC("usdt")
-int BPF_USDT(perfspan_exit, u64 span_id) {
+int BPF_USDT(perfspan_exit, u64 span_id)
+{
     // stream the following data using ring buffer
     // EXIT || thread_id || span_id || timestamp || cfg.enable_events...
     // 1    || 8         || 8       || 8         || 8 * cfg.enable_events
@@ -108,7 +119,7 @@ int BPF_USDT(perfspan_exit, u64 span_id) {
     u64 timestamp = bpf_ktime_get_ns();
     u64 to_reserve = 1 + 8 + 8 + 8 + 8 * cfg.enabled_events;
     u8 *cursor = bpf_ringbuf_reserve(&events, to_reserve, 0);
-    if !cursor
+    if (!cursor)
     {
         bpf_printk("ringbuf_reserve %d failed\n", to_reserve);
         return 1;
