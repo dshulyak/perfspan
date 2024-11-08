@@ -5,12 +5,15 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/usdt.bpf.h>
 
+const MAX_EVENTS = 128;
+const MAX_NAME_SIZE = 16;
+
 struct
 {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
-    __uint(max_entries, 128); // max number of events that can be enabled
+    __uint(max_entries, MAX_EVENTS);
 } perf_events SEC(".maps");
 
 struct
@@ -49,7 +52,7 @@ enum
     EXIT = 1
 };
 
-__always_inline void stream_header(u8 *cursor, u8 event_type, u64 thread_id, u64 span_id, u64 timestamp)
+__always_inline void write_header(u8 *cursor, u8 event_type, u64 thread_id, u64 span_id, u64 timestamp)
 {
     *cursor = event_type;
     cursor += 1;
@@ -61,18 +64,15 @@ __always_inline void stream_header(u8 *cursor, u8 event_type, u64 thread_id, u64
     cursor += 8;
 }
 
-__always_inline void stream_name(u8 *cursor, u16 name_size, void *name)
-{
-    *(u16 *)cursor = name_size;
-    cursor += 2;
-    bpf_probe_read_user(cursor, name_size, name);
-    cursor += name_size;
+__always_inline void write_name(u8 *cursor, u64 name_size, void *name)
+{   
+    u64 limited = name_size > MAX_NAME_SIZE ? MAX_NAME_SIZE : name_size;
+    bpf_probe_read_user(cursor, limited, name);
+    cursor += MAX_NAME_SIZE;
 }
 
-__always_inline void stream_perf_events(u8 *cursor)
+__always_inline void write_perf_counters(u8 *cursor)
 {
-    // if this won't be allowed define constant for max number of events
-    // and terminate early if i >= cfg.enabled_events
     for (int i = 0; i < cfg.enabled_events; i++)
     {
         u64 *val = bpf_map_lookup_elem(&perf_events, &i);
@@ -89,23 +89,28 @@ __always_inline void stream_perf_events(u8 *cursor)
 }
 
 SEC("usdt")
-int BPF_USDT(perfspan_enter, u64 span_id, u16 name_size, void *name)
+int BPF_USDT(perfspan_enter, u64 span_id, u64 name_size, void *name)
 {
     // stream the following data using ring buffer
-    // ENTER || thread_id || span_id || timestamp || name_size || name || cfg.enable_events...
-    // 1     || 8         || 8       || 8         || 2         || name || 8 * cfg.enable_events
+    // ENTER || thread_id || span_id || timestamp || name          || cfg.enable_events...
+    // 1     || 8         || 8       || 8         || MAX_NAME_SIZE || 8 * cfg.enable_events
     u64 thread_id = bpf_get_current_pid_tgid();
     u64 timestamp = bpf_ktime_get_ns();
-    u64 to_reserve = 1 + 8 + 8 + 2 + name_size + 8 + 8 * cfg.enabled_events;
-    u8 *cursor = bpf_ringbuf_reserve(&events, to_reserve, 0);
-    if (!cursor)
+    u32 enabled_events = cfg.enabled_events;
+    u64 to_reserve = 1 + 8 + 8 + 8 + MAX_NAME_SIZE + 8 * enabled_events;
+    u8 *reserved = bpf_ringbuf_reserve(&events, to_reserve, 0);
+    if (!reserved)
     {
         bpf_printk("ringbuf_reserve %d failed\n", to_reserve);
         return 1;
     }
-    stream_header(cursor, ENTER, thread_id, span_id, timestamp);
-    stream_name(cursor, name_size, name);
-    stream_perf_events(cursor);
+    u8 *cursor = reserved;
+    bpf_printk("cursor %p\n", cursor);
+    write_header(cursor, ENTER, thread_id, span_id, timestamp);
+    cursor += 25;
+    write_name(cursor, name_size, name);
+    // write_perf_counters(cursor);
+    bpf_ringbuf_submit(reserved, 0);
     return 0;
 }
 
@@ -117,15 +122,19 @@ int BPF_USDT(perfspan_exit, u64 span_id)
     // 1    || 8         || 8       || 8         || 8 * cfg.enable_events
     u64 thread_id = bpf_get_current_pid_tgid();
     u64 timestamp = bpf_ktime_get_ns();
-    u64 to_reserve = 1 + 8 + 8 + 8 + 8 * cfg.enabled_events;
-    u8 *cursor = bpf_ringbuf_reserve(&events, to_reserve, 0);
-    if (!cursor)
+    u32 enabled_events = cfg.enabled_events;
+    u64 to_reserve = 1 + 8 + 8 + 8 + 8 * enabled_events;
+    void *reserved = bpf_ringbuf_reserve(&events, to_reserve, 0);
+    if (!reserved)
     {
         bpf_printk("ringbuf_reserve %d failed\n", to_reserve);
         return 1;
     }
-    stream_header(cursor, EXIT, thread_id, span_id, timestamp);
-    stream_perf_events(cursor);
+    u8 *cursor = reserved;
+    write_header(cursor, EXIT, thread_id, span_id, timestamp);
+    cursor += 25;
+    write_perf_counters(cursor);
+    bpf_ringbuf_submit(reserved, 0);
     return 0;
 }
 

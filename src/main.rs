@@ -1,4 +1,4 @@
-use std::{mem::MaybeUninit, path::PathBuf};
+use std::{mem::MaybeUninit, path::PathBuf, time::Duration};
 
 use clap::Parser;
 use eyre::{Result, WrapErr};
@@ -6,7 +6,7 @@ use libbpf_rs::{
     skel::{OpenSkel, SkelBuilder},
     RingBufferBuilder,
 };
-use tracing::level_filters::LevelFilter;
+use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::EnvFilter;
 
 mod stacks {
@@ -54,8 +54,13 @@ fn main() -> Result<()> {
     );
     let mut ring = RingBufferBuilder::new();
 
-    ring.add(&skel.maps.events, |buf| 0)?;
+    ring.add(&skel.maps.events, |buf| {
+        info!("length {} event: {:?}", buf.len(), buf);
+        0
+    })?;
     let ring = ring.build()?;
-    ring.consume()?;
+    loop {
+        ring.poll(Duration::MAX)?;
+    }
     Ok(())
 }

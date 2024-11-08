@@ -7,6 +7,7 @@ edition = "2021"
 clap = { version = "4.5.20", features = ["derive"] }
 ctrlc = "3.4.5"
 eyre = "0.6.12"
+hashbrown = "0.15.1"
 libbpf-rs = { version = "0.24.7", features = ["vendored"] }
 plain = "0.2.3"
 probe = "0.5.1"
