@@ -1,0 +1,27 @@
+[package]
+name = "perfspan"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ctrlc = "3.4.5"
+eyre = "0.6.12"
+libbpf-rs = { version = "0.24.7", features = ["vendored"] }
+plain = "0.2.3"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+[build-dependencies]
+grev = "0.1.3"
+libbpf-cargo = "0.23"
+vmlinux = { git = "https://github.com/libbpf/libbpf-rs", tag = "v0.23.3"}
+
+[features]
+# default to vendoring, as i intend to use it only this way
+default = ["libbpf-rs/vendored"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
