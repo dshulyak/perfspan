@@ -19,8 +19,10 @@ where
 
     fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
+            let name_size = span.name().len() as u16;
+            let name = span.name().as_ptr();
             let span_id = span.id().into_u64();
-            probe!(perfspan, exit, span_id);
+            probe!(perfspan, exit, span_id, name_size, name);
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::{thread::sleep, time::Duration};
+use std::time::Duration;
 
 use perfspan::PerfspanSubscriber;
 use tracing::{instrument, level_filters::LevelFilter};
@@ -22,5 +22,7 @@ fn main() {
 
 #[instrument]
 fn anything() {
-    sleep(Duration::from_secs(1));
+    // spin for 10ms
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(10) {}
 }
