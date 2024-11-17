@@ -22,16 +22,16 @@ type Event = perfspan::types::event;
 
 #[derive(Parser)]
 struct Opt {
-    #[clap(short, long, help = "path to the binary to monitor")]
+    #[clap(help = "path to the binary to monitor", required = true)]
     binary: PathBuf,
+    #[clap(help = "list of spans to monitor", required = true)]
+    spans: Vec<String>,
     #[clap(
         short,
         long,
-        help = "pid of the process to monitor. optional, if not provided all spans will be collected"
+        help = "pid of the process to monitor. optional, if not provided spans from all processes will be collected"
     )]
-    pid: Option<i32>,
-    #[clap(required = true, help = "list of spans to monitor")]
-    spans: Vec<String>,
+    pid: Option<u32>,
 }
 
 const USDT_PROVIDER: &str = "perfspan";
@@ -57,6 +57,9 @@ fn main() -> Result<()> {
     let builder = perfspan::PerfspanSkelBuilder::default()
         .open(&mut open_object)
         .wrap_err("failed to open BPF object")?;
+    builder.maps.rodata_data.cfg.filter_tgid = opt.pid.unwrap_or(0);
+    // TODO this should match number of registered perf counters
+    builder.maps.rodata_data.cfg.enabled_events = 0;
     let skel = builder.load()?;
 
     links.push(skel.progs.perfspan_enter.attach_usdt(
@@ -150,7 +153,8 @@ fn main() -> Result<()> {
             if hist.is_empty() {
                 return;
             }
-            hist.iter_log(hist.min(), 2.0)
+            let delta = hist.max() - hist.min();
+            hist.iter_linear(delta / 10)
                 .skip_while(|v| v.quantile() < 0.01)
                 .for_each(|v| {
                     println!(

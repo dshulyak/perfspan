@@ -34,8 +34,10 @@ struct
 const volatile struct
 {
     u32 enabled_events;
+    u32 filter_tgid;
 } cfg = {
     .enabled_events = 0,
+    .filter_tgid = 0,
 };
 
 SEC("perf_event")
@@ -72,10 +74,13 @@ __always_inline void write_perf_counters(u8 *cursor)
     }
 }
 
-static __always_inline void print_byte_array(const char *arr, size_t size) {
+static __always_inline void print_byte_array(const char *arr, size_t size)
+{
     bpf_printk("[");
-    for (size_t i = 0; i < size; i++) {
-        if (i > 0) {
+    for (size_t i = 0; i < size; i++)
+    {
+        if (i > 0)
+        {
             bpf_printk(", ");
         }
         bpf_printk("%d", arr[i] & 0xff);
@@ -83,21 +88,29 @@ static __always_inline void print_byte_array(const char *arr, size_t size) {
     bpf_printk("]\n");
 }
 
-__always_inline int try_submit_event(u8 event_type, u64 span_id, u64 name_size, char *name) {
+__always_inline int try_submit_event(u8 event_type, u64 span_id, u64 name_size, char *name)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (cfg.filter_tgid != 0 && pid_tgid >> 32 != cfg.filter_tgid)
+    {
+        return 0;
+    }
+
     __u8 span_name[MAX_NAME_SIZE] = {0};
-    if (name_size > MAX_NAME_SIZE) {
+    if (name_size > MAX_NAME_SIZE)
+    {
         name_size = MAX_NAME_SIZE;
     }
     bpf_probe_read_user(&span_name, name_size, name);
     bpf_printk("span_name: %s size %d\n", span_name, name_size);
     __u8 *name_id = bpf_map_lookup_elem(&filter_by_name, &span_name);
-    if (!name_id) {
+    if (!name_id)
+    {
         return 0;
     }
 
-    u64 pid_tgid = bpf_get_current_pid_tgid();
     u64 timestamp = bpf_ktime_get_ns();
-    
+
     u64 to_reserve = sizeof(struct event) + sizeof(__u64) * cfg.enabled_events;
     void *reserved = bpf_ringbuf_reserve(&events, to_reserve, 0);
     if (!reserved)
@@ -107,14 +120,14 @@ __always_inline int try_submit_event(u8 event_type, u64 span_id, u64 name_size, 
     }
 
     u8 *cursor = reserved;
-    struct event *ev = cursor; 
+    struct event *ev = cursor;
     ev->type = event_type;
     ev->name_id = *name_id;
     ev->span_id = span_id;
     ev->pid_tgid = pid_tgid;
     ev->timestamp = timestamp;
     cursor += sizeof(struct event);
-    
+
     write_perf_counters(cursor);
 
     bpf_ringbuf_submit(reserved, 0);
