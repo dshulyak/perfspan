@@ -10,6 +10,7 @@ eyre = "0.6.12"
 hashbrown = "0.15.1"
 hdrhistogram = "7.5.4"
 libbpf-rs = { version = "0.24.7", features = ["vendored"] }
+libc = "0.2.164"
 plain = "0.2.3"
 probe = "0.5.1"
 tracing = "0.1.40"
