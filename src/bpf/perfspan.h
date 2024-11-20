@@ -6,7 +6,7 @@
 #endif
 
 #ifndef MAX_EVENTS
-#define MAX_EVENTS 2
+#define MAX_EVENTS 4
 #endif
 
 const __u8 ENTER = 0;

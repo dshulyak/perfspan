@@ -6,14 +6,14 @@ use hashbrown::HashMap;
 use hdrhistogram::{iterators::IterationValue, Histogram};
 use libbpf_rs::{
     skel::{OpenSkel, SkelBuilder},
-    MapCore, MapFlags, OpenObject, RingBufferBuilder,
+    Link, MapCore, MapFlags, OpenObject, RingBufferBuilder,
 };
 use perf::{
     attach_event_with_cookie, enable_on_all_cpus, open_cycles_event, open_instructions_event,
 };
 use perfspan::PerfspanSkel;
 use plain::Plain;
-use tracing::{debug, error, level_filters::LevelFilter, warn};
+use tracing::{debug, error, level_filters::LevelFilter, trace, warn};
 use tracing_subscriber::EnvFilter;
 
 mod perfspan {
@@ -42,9 +42,13 @@ struct Opt {
         long,
         help = "collect additional performance events for each span. 
         examples: 
-            - cycles=1000
-            - instructions=1000
-        second argument is a sample_period for the event"
+            - cycles
+        Ccollect cycles event with default sample_period=10_000_000
+            - instructions=1000000
+        Collect instructions event with sample_period=1_000_000
+            - cache_ref=2=10000
+        Collect cache references event with config=2 and sample_period=10_000
+        The name (first part) is only for UX purposes, the actual captured event is determined by the config"
     )]
     events: Vec<PerfEvent>,
     #[clap(
@@ -60,18 +64,24 @@ const USDT_PROVIDER: &str = "perfspan";
 const USDT_ENTER: &str = "enter";
 const USDT_EXIT: &str = "exit";
 
-// when adding new event type make sure that MAX_EVENTS in perfspan.h is updated
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+const DEFAULT_SAMPLE_PERIOD: u64 = 10_000_000;
+
+const CYCLES: &str = "cycles";
+const INSTRUCTIONS: &str = "instructions";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum PerfEvent {
     Cycles(u64),
     Instructions(u64),
+    Custom(String, u64, u64),
 }
 
 impl PerfEvent {
     fn as_str(&self) -> &str {
         match self {
-            Self::Cycles(_) => "cycles",
-            Self::Instructions(_) => "instructions",
+            Self::Cycles(_) => CYCLES,
+            Self::Instructions(_) => INSTRUCTIONS,
+            Self::Custom(name, _, _) => name,
         }
     }
 
@@ -79,6 +89,9 @@ impl PerfEvent {
         match self {
             Self::Cycles(period) => open_cycles_event(pid, cpu, *period),
             Self::Instructions(period) => open_instructions_event(pid, cpu, *period),
+            Self::Custom(_, config, period) => {
+                perf::open_hardware_event(pid, cpu, *config, *period)
+            }
         }
     }
 }
@@ -87,19 +100,31 @@ impl FromStr for PerfEvent {
     type Err = eyre::Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let mut parts = s.splitn(2, "=");
+        let mut parts = s.split("=");
+
         let event = parts
             .next()
             .ok_or_else(|| eyre::eyre!("missing event type"))?;
-        let freq = parts
-            .next()
-            .ok_or_else(|| eyre::eyre!("missing frequency for event {}", event))?
-            .parse()
-            .wrap_err_with(|| format!("failed to parse frequency for event {}", event))?;
+
+        let parse_period = |period: Option<&str>| -> Result<u64> {
+            let period = period.map_or(Ok(DEFAULT_SAMPLE_PERIOD), |p| {
+                p.parse()
+                    .wrap_err_with(|| format!("failed to parse sample_period: {}", p))
+            })?;
+            Ok(period)
+        };
+
         match event {
-            "cycles" => Ok(Self::Cycles(freq)),
-            "instructions" => Ok(Self::Instructions(freq)),
-            _ => Err(eyre::eyre!("unknown event type: {}", event)),
+            CYCLES => Ok(Self::Cycles(parse_period(parts.next())?)),
+            INSTRUCTIONS => Ok(Self::Instructions(parse_period(parts.next())?)),
+            _ => {
+                let config = parts
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("missing config"))?
+                    .parse()?;
+                let period = parse_period(parts.next())?;
+                Ok(Self::Custom(event.to_string(), config, period))
+            }
         }
     }
 }
@@ -118,8 +143,15 @@ fn main() -> Result<()> {
 
     let opt = Opt::parse();
 
+    let counters_max_size = Event::default().counters.len();
+    eyre::ensure!(
+        opt.events.len() <= counters_max_size,
+        "too many events requested, max is {}",
+        counters_max_size
+    );
+
     let mut open_object = MaybeUninit::uninit();
-    let skel = register_bpf_program(&opt, &mut open_object)?;
+    let (skel, _links) = register_bpf_program(&opt, &mut open_object)?;
 
     let mut histograms_perf_span: Vec<SpanHistograms> = opt
         .spans
@@ -138,7 +170,7 @@ fn main() -> Result<()> {
 fn register_bpf_program<'b>(
     opt: &Opt,
     open_object: &'b mut MaybeUninit<OpenObject>,
-) -> Result<PerfspanSkel<'b>> {
+) -> Result<(PerfspanSkel<'b>, Vec<Link>)> {
     let mut links = vec![];
     let builder = perfspan::PerfspanSkelBuilder::default()
         .open(open_object)
@@ -175,13 +207,14 @@ fn register_bpf_program<'b>(
             .update(&name, &(i as u8).to_ne_bytes(), MapFlags::ANY)
             .wrap_err("failed to insert span name")?;
     }
-    Ok(skel)
+    Ok((skel, links))
 }
 
 fn poll_events(skel: PerfspanSkel<'_>, histograms_per_span: &mut [SpanHistograms]) -> Result<()> {
     let mut open_spans = HashMap::new();
     let mut ring = RingBufferBuilder::new();
     ring.add(&skel.maps.events, |buf| {
+        trace!("received event {:?}", buf);
         let ev = match plain::from_bytes::<Event>(buf) {
             Ok(ev) => ev,
             Err(e) => {
