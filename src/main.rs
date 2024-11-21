@@ -176,6 +176,8 @@ fn main() -> Result<()> {
     })
     .wrap_err("failed to set interrupt handler")?;
 
+    bump_memlock_rlimit()?;
+
     let filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
@@ -441,4 +443,17 @@ fn print_counters_distribution(v: IterationValue<u64>, total_count: u64) {
         ),
         v.percentile(),
     );
+}
+
+fn bump_memlock_rlimit() -> Result<()> {
+    let rlimit = libc::rlimit {
+        rlim_cur: 128 << 20,
+        rlim_max: 128 << 20,
+    };
+
+    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) } != 0 {
+        eyre::bail!("Failed to increase rlimit");
+    }
+
+    Ok(())
 }
