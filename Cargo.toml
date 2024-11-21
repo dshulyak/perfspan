@@ -12,9 +12,12 @@ hdrhistogram = "7.5.4"
 libbpf-rs = { version = "0.24.7", features = ["vendored"] }
 libc = "0.2.164"
 plain = "0.2.3"
-probe = "0.5.1"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+[dev-dependencies]
+tracing-perfspan = { path = "./tracing-perfspan" }
+rand = "0.8.5"
 
 [build-dependencies]
 eyre = "0.6.12"
@@ -31,6 +34,3 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
-
-[dev-dependencies]
-rand = "0.8.5"

@@ -3,9 +3,7 @@ use std::hint::black_box;
 use clap::Parser;
 use eyre::Result;
 
-use perfspan::PerfspanSubscriber;
-use tracing::{instrument, level_filters::LevelFilter};
-use tracing_subscriber::{prelude::*, Registry};
+use tracing::instrument;
 
 #[derive(Parser)]
 struct Opt {
@@ -16,15 +14,7 @@ struct Opt {
 }
 
 fn main() -> Result<()> {
-    let registry = Registry::default().with(
-        PerfspanSubscriber {}.with_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        ),
-    );
-    tracing::dispatcher::set_global_default(registry.into())
-        .expect("failed to set global default subscriber");
+    tracing_perfspan::init();
 
     let opt = Opt::parse();
     let mut matrix_a = vec![vec![0.0; opt.size]; opt.size];

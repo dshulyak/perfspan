@@ -31,19 +31,15 @@ struct Opt {
     binary: PathBuf,
     #[clap(help = "list of spans to monitor", required = true)]
     spans: Vec<String>,
-    #[clap(
-        short,
-        long,
-        help = "pid of the process to monitor. optional, if not provided spans from all processes will be collected"
-    )]
-    pid: Option<i32>,
+    #[clap(short, long, help = "pid to monitor. if not set, all processes are monitored")]
+    pid:  Option<i32>,
     #[clap(
         short,
         long,
         help = "collect additional performance events for each span. 
         examples: 
             - cycles
-        Ccollect cycles event with default sample_period=10_000_000
+        Collect cycles event with default sample_period=10_000_000
             - instructions=1000000
         Collect instructions event with sample_period=1_000_000
             - cache_ref=2=10000
@@ -73,10 +69,14 @@ const INSTRUCTIONS: &str = "instructions";
 enum PerfEvent {
     Cycles(u64),
     Instructions(u64),
+    // custom is a cheap way to support capturing any events that perf subsystem supports.
+    // the format is "name=type:config=period"
+    // for example: "cache_ref=1:2=10000"
     Custom(String, u64, u64),
 }
 
 impl PerfEvent {
+    /// Returns a string representation of the event type.
     fn as_str(&self) -> &str {
         match self {
             Self::Cycles(_) => CYCLES,
@@ -85,7 +85,8 @@ impl PerfEvent {
         }
     }
 
-    fn enable(&self, pid: i32, cpu: i32) -> Result<i64> {
+    /// Enables a performance counter for the specified process ID and CPU.
+    fn enable_perf_counter(&self, pid: i32, cpu: i32) -> Result<i64> {
         match self {
             Self::Cycles(period) => open_cycles_event(pid, cpu, *period),
             Self::Instructions(period) => open_instructions_event(pid, cpu, *period),
@@ -99,6 +100,7 @@ impl PerfEvent {
 impl FromStr for PerfEvent {
     type Err = eyre::Error;
 
+    /// Parses a string into a `PerfEvent` instance.
     fn from_str(s: &str) -> Result<Self> {
         let mut parts = s.split("=");
 
@@ -152,7 +154,7 @@ fn main() -> Result<()> {
 
     let mut open_object = MaybeUninit::uninit();
     let (skel, _links) = register_bpf_program(&opt, &mut open_object)?;
-
+    
     let mut histograms_perf_span: Vec<SpanHistograms> = opt
         .spans
         .iter()
@@ -161,8 +163,8 @@ fn main() -> Result<()> {
     poll_events(skel, &mut histograms_perf_span)?;
 
     println!(); // separate ^C from the output
-    for hist in histograms_perf_span.iter() {
-        hist.print(opt.buckets);
+    for histogram in histograms_perf_span.iter() {
+        histogram.print(opt.buckets);
     }
     Ok(())
 }
@@ -191,7 +193,7 @@ fn register_bpf_program<'b>(
             .attach_usdt(-1, &opt.binary, USDT_PROVIDER, USDT_EXIT)?,
     );
     for (cookie, event) in opt.events.iter().enumerate() {
-        let pfds = enable_on_all_cpus(|cpu| event.enable(opt.pid.unwrap_or(-1), cpu))?;
+        let pfds = enable_on_all_cpus(|cpu| event.enable_perf_counter(opt.pid.unwrap_or(-1), cpu))?;
         for pfd in pfds.iter() {
             debug!("opened perf event: {}", pfd);
             let link =
