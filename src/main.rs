@@ -1,16 +1,18 @@
-use std::{mem::MaybeUninit, path::PathBuf, str::FromStr, time::Duration};
+use std::{fmt::Display, mem::MaybeUninit, path::PathBuf, str::FromStr, time::Duration};
 
-use clap::Parser;
+use clap::{
+    builder::{IntoResettable, Resettable, StyledStr},
+    Parser,
+};
 use eyre::{Result, WrapErr};
 use hashbrown::HashMap;
 use hdrhistogram::{iterators::IterationValue, Histogram};
 use libbpf_rs::{
+    libbpf_sys::{self},
     skel::{OpenSkel, SkelBuilder},
     Link, MapCore, MapFlags, OpenObject, RingBufferBuilder,
 };
-use perf::{
-    attach_event_with_cookie, enable_on_all_cpus, open_cycles_event, open_instructions_event,
-};
+use perf::{attach_event_with_cookie, enable_on_all_cpus, open_perf_event};
 use perfspan::PerfspanSkel;
 use plain::Plain;
 use tracing::{debug, error, level_filters::LevelFilter, trace, warn};
@@ -31,22 +33,18 @@ struct Opt {
     binary: PathBuf,
     #[clap(help = "list of spans to monitor", required = true)]
     spans: Vec<String>,
-    #[clap(short, long, help = "pid to monitor. if not set, all processes are monitored")]
-    pid:  Option<i32>,
     #[clap(
         short,
         long,
-        help = "collect additional performance events for each span. 
-        examples: 
-            - cycles
-        Collect cycles event with default sample_period=10_000_000
-            - instructions=1000000
-        Collect instructions event with sample_period=1_000_000
-            - cache_ref=2=10000
-        Collect cache references event with config=2 and sample_period=10_000
-        The name (first part) is only for UX purposes, the actual captured event is determined by the config"
+        help = "pid to monitor. if not set, all processes are monitored"
     )]
-    events: Vec<PerfEvent>,
+    pid: Option<i32>,
+    #[clap(
+        short,
+        long,
+        help = PerfEventSpecHelp{},
+    )]
+    events: Vec<PerfEventSpec>,
     #[clap(
         short,
         long,
@@ -60,76 +58,116 @@ const USDT_PROVIDER: &str = "perfspan";
 const USDT_ENTER: &str = "enter";
 const USDT_EXIT: &str = "exit";
 
-const DEFAULT_SAMPLE_PERIOD: u64 = 10_000_000;
+struct PerfEventSpecHelp {}
 
-const CYCLES: &str = "cycles";
-const INSTRUCTIONS: &str = "instructions";
+impl IntoResettable<StyledStr> for PerfEventSpecHelp {
+    fn into_resettable(self) -> Resettable<StyledStr> {
+        // build help string from SUPPORTED_PERF_EVENTS
+        let mut help = String::new();
+        help.push_str("supported events:\n");
+        for event in SUPPORTED_PERF_EVENTS {
+            help.push_str(&format!(" - {}\n", &event));
+        }
+        help.push_str("sample period is optional. default value is written for every event");
+        Resettable::Value(StyledStr::from(help))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum PerfEvent {
-    Cycles(u64),
-    Instructions(u64),
-    // custom is a cheap way to support capturing any events that perf subsystem supports.
-    // the format is "name=type:config=period"
-    // for example: "cache_ref=1:2=10000"
-    Custom(String, u64, u64),
+struct PerfEventSpec {
+    name: &'static str,
+    type_: u32,
+    config: u32,
+    sample_period: u64,
 }
 
-impl PerfEvent {
-    /// Returns a string representation of the event type.
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Cycles(_) => CYCLES,
-            Self::Instructions(_) => INSTRUCTIONS,
-            Self::Custom(name, _, _) => name,
-        }
-    }
-
-    /// Enables a performance counter for the specified process ID and CPU.
-    fn enable_perf_counter(&self, pid: i32, cpu: i32) -> Result<i64> {
-        match self {
-            Self::Cycles(period) => open_cycles_event(pid, cpu, *period),
-            Self::Instructions(period) => open_instructions_event(pid, cpu, *period),
-            Self::Custom(_, config, period) => {
-                perf::open_hardware_event(pid, cpu, *config, *period)
-            }
-        }
-    }
-}
-
-impl FromStr for PerfEvent {
+impl FromStr for PerfEventSpec {
     type Err = eyre::Error;
-
-    /// Parses a string into a `PerfEvent` instance.
+    /// Parses event spec from a string into one of the supported events.
+    /// The format is "name=period" where period is optional and name must match of the existing events
     fn from_str(s: &str) -> Result<Self> {
         let mut parts = s.split("=");
-
-        let event = parts
+        let name = parts
             .next()
-            .ok_or_else(|| eyre::eyre!("missing event type"))?;
-
-        let parse_period = |period: Option<&str>| -> Result<u64> {
-            let period = period.map_or(Ok(DEFAULT_SAMPLE_PERIOD), |p| {
-                p.parse()
-                    .wrap_err_with(|| format!("failed to parse sample_period: {}", p))
-            })?;
-            Ok(period)
-        };
-
-        match event {
-            CYCLES => Ok(Self::Cycles(parse_period(parts.next())?)),
-            INSTRUCTIONS => Ok(Self::Instructions(parse_period(parts.next())?)),
-            _ => {
-                let config = parts
-                    .next()
-                    .ok_or_else(|| eyre::eyre!("missing config"))?
-                    .parse()?;
-                let period = parse_period(parts.next())?;
-                Ok(Self::Custom(event.to_string(), config, period))
-            }
+            .ok_or_else(|| eyre::eyre!("missing event name"))?;
+        let matched = SUPPORTED_PERF_EVENTS.iter().find(|e| e.name == name);
+        eyre::ensure!(matched.is_some(), "unknown event name: {}", name);
+        let mut matched = matched.unwrap().clone();
+        if let Some(period) = parts.next() {
+            matched.sample_period = period.parse()?;
         }
+        Ok(matched)
     }
 }
+
+impl Display for PerfEventSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={}", self.name, self.sample_period)
+    }
+}
+
+const SUPPORTED_PERF_EVENTS: &[PerfEventSpec] = &[
+    PerfEventSpec {
+        name: "cycles",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_CPU_CYCLES,
+        sample_period: 10_000_000,
+    },
+    PerfEventSpec {
+        name: "instructions",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_INSTRUCTIONS,
+        sample_period: 10_000_000,
+    },
+    PerfEventSpec {
+        name: "cache_references",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_CACHE_REFERENCES,
+        sample_period: 1_000,
+    },
+    PerfEventSpec {
+        name: "cache_misses",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_CACHE_MISSES,
+        sample_period: 1_000,
+    },
+    PerfEventSpec {
+        name: "branch_instructions",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
+        sample_period: 1_000_000,
+    },
+    PerfEventSpec {
+        name: "branch_misses",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_BRANCH_MISSES,
+        sample_period: 1_000_000,
+    },
+    PerfEventSpec {
+        name: "bus_cycles",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_BUS_CYCLES,
+        sample_period: 1_000_000,
+    },
+    PerfEventSpec {
+        name: "stalled_cycles_frontend",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_STALLED_CYCLES_FRONTEND,
+        sample_period: 1_000_000,
+    },
+    PerfEventSpec {
+        name: "stalled_cycles_backend",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_STALLED_CYCLES_BACKEND,
+        sample_period: 1_000_000,
+    },
+    PerfEventSpec {
+        name: "ref_cpu_cycles",
+        type_: libbpf_sys::PERF_TYPE_HARDWARE,
+        config: libbpf_sys::PERF_COUNT_HW_REF_CPU_CYCLES,
+        sample_period: 1_000_000,
+    },
+];
 
 fn main() -> Result<()> {
     // this is set so that ring.poll doesn't exit without handing out control back to the main
@@ -154,7 +192,7 @@ fn main() -> Result<()> {
 
     let mut open_object = MaybeUninit::uninit();
     let (skel, _links) = register_bpf_program(&opt, &mut open_object)?;
-    
+
     let mut histograms_perf_span: Vec<SpanHistograms> = opt
         .spans
         .iter()
@@ -192,8 +230,17 @@ fn register_bpf_program<'b>(
             .perfspan_exit
             .attach_usdt(-1, &opt.binary, USDT_PROVIDER, USDT_EXIT)?,
     );
+    let pid = opt.pid.unwrap_or(-1);
     for (cookie, event) in opt.events.iter().enumerate() {
-        let pfds = enable_on_all_cpus(|cpu| event.enable_perf_counter(opt.pid.unwrap_or(-1), cpu))?;
+        let pfds = enable_on_all_cpus(|cpu| {
+            open_perf_event(
+                pid,
+                cpu,
+                event.type_,
+                event.config as u64,
+                event.sample_period,
+            )
+        })?;
         for pfd in pfds.iter() {
             debug!("opened perf event: {}", pfd);
             let link =
@@ -282,11 +329,11 @@ fn max_name_size_string(s: &str) -> [u8; MAX_NAME_SIZE] {
 struct SpanHistograms {
     span_name: String,
     latency: Histogram<u64>,
-    counters: Vec<(PerfEvent, Histogram<u64>)>,
+    counters: Vec<(PerfEventSpec, Histogram<u64>)>,
 }
 
 impl SpanHistograms {
-    fn new(span_name: String, perf_events: impl Iterator<Item = PerfEvent>) -> Self {
+    fn new(span_name: String, perf_events: impl Iterator<Item = PerfEventSpec>) -> Self {
         let latency = Histogram::new_with_bounds(1, u64::MAX, 3).expect("messed up arguments");
         let counters = perf_events
             .map(|event| {
@@ -337,7 +384,7 @@ impl SpanHistograms {
         for (event, hist) in self.counters.iter() {
             print_histogram(
                 &self.span_name,
-                event.as_str(),
+                event.name,
                 buckets,
                 hist,
                 print_counters_distribution,

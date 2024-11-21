@@ -3,9 +3,7 @@ use std::{io, mem, ptr::NonNull};
 use eyre::{Result, WrapErr};
 use libbpf_rs::{
     libbpf_sys::{
-        bpf_perf_event_opts, bpf_program__attach_perf_event_opts, libbpf_get_error,
-        perf_event_attr, PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_SAMPLE_RAW,
-        PERF_TYPE_HARDWARE,
+        bpf_perf_event_opts, bpf_program__attach_perf_event_opts, libbpf_get_error, perf_event_attr, PERF_SAMPLE_RAW,
     },
     AsRawLibbpf, Error as BPFError, Link, ProgramMut,
 };
@@ -20,16 +18,8 @@ pub fn enable_on_all_cpus<F: Fn(i32) -> Result<i64>>(open_event_fn: F) -> Result
     Ok(fds)
 }
 
-pub fn open_cycles_event(pid: i32, cpu: i32, period: u64) -> Result<i64> {
-    open_hardware_event(pid, cpu, PERF_COUNT_HW_CPU_CYCLES as u64, period)
-}
-
-pub fn open_instructions_event(pid: i32, cpu: i32, period: u64) -> Result<i64> {
-    open_hardware_event(pid, cpu, PERF_COUNT_HW_INSTRUCTIONS as u64, period)
-}
-
-pub fn open_hardware_event(pid: i32, cpu: i32, config: u64, period: u64) -> Result<i64> {
-    open_event(PERF_TYPE_HARDWARE, PERF_SAMPLE_RAW as u64, config, period, pid, cpu, 0)
+pub fn open_perf_event(pid: i32, cpu: i32, type_: u32, config: u64, period: u64) -> Result<i64> {
+    open_event(type_, PERF_SAMPLE_RAW as u64, config, period, pid, cpu, 0)
 }
 
 pub fn attach_event_with_cookie(prog: &ProgramMut<'_>, pfd: i32, cookie: u64) -> Result<Link> {
